@@ -96,7 +96,7 @@ freetv_other_lines = []
 
 
 # 定义
-urls = ["https://freetv.fun/test_channels_original_new.txt"]
+urls = ["https://raw.githubusercontent.com/DEvmIb/famelack-channels-m3u/refs/heads/main/m3u/_all.m3u"]
 
 # 处理
 for url in urls:
