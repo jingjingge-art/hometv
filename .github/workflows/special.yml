@@ -38,8 +38,13 @@ jobs:
           git commit -m ":tv:  (special)AutoUpdate $(date -d "+8 hours" +'%Y%m%d')"
           
     - name: Push changes
-      uses: ad-m/github-push-action@master
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-    
-        
+      run: |
+        # Other scheduled workflows can update main at the same time. Rebase
+        # our generated files onto the latest main before retrying the push.
+        for attempt in 1 2 3 4 5; do
+          git pull --rebase origin main && git push origin HEAD:main && exit 0
+          echo "Push attempt ${attempt} failed; retrying in $((attempt * 2)) seconds..."
+          sleep $((attempt * 2))
+        done
+        echo "Unable to push changes after 5 attempts."
+        exit 1
