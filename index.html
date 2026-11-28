@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>种子扫描｜上限20｜并发300｜300ms内保留</title>
+    <title>种子扫描｜+20网段｜并发300｜最快200</title>
     <style>
         * { box-sizing: border-box; }
         body {
@@ -102,8 +102,6 @@
             overflow-y: auto;
             display: none;
         }
-        .ms-tag { color: #60a5fa; }
-        .slow { color: #f97316; }
     </style>
 </head>
 <body>
@@ -113,19 +111,19 @@
             <span class="spinner" id="spinner"></span>
         </h1>
         <div class="warn">
-            ⚠️ 每段上限 +20｜并发 300｜仅保留 ≤300ms｜浏览器探测 ≠ 真实 ICMP ping｜仅限自有授权网络测试！
+            ⚠️ 每段 +20 个IP｜并发 300｜保留最快 200｜无固定超时，只筛选有效响应｜浏览器探测 ≠ 真实 ICMP ping｜仅限自有授权网络测试！
         </div>
         <div class="btn-area">
             <button id="start">开始扫描</button>
             <button id="pause" class="sec" disabled>暂停</button>
             <button id="stop" class="danger" disabled>停止</button>
-            <button id="save" class="sec" disabled>导出 300ms内_IP端口.txt</button>
+            <button id="save" class="sec" disabled>下载 top200_fast_ip.txt</button>
         </div>
         <div class="info">
             <span>状态：<b id="status">等待</b></span>
             <span>进度：<b id="progress">0 / 0</b></span>
             <span>有效：<b id="hit">0</b></span>
-            <span>≤300ms：<b id="final">0</b></span>
+            <span>最终：<b id="final">0</b></span>
             <span>耗时：<b id="elapsed">0.0s</b></span>
         </div>
         <div id="log"></div>
@@ -153,10 +151,10 @@
                 6666, 6677, 7788, 8080, 8099, 8899, 9901, 9999,
                 12345, 6888, 8188
             ],
-            SEGMENT_MAX: 20,
-            CONCURRENT: 300,
-            RESPONSE_LIMIT: 300, // 保留 ≤300ms
-            TIMEOUT: 1800,
+            SEGMENT_STEP: 20,       // 每段往后加20个IP
+            CONCURRENT: 300,        // 并发数
+            KEEP_TOP: 200,          // 保留最快200个
+            MAX_WAIT: 10000,        // 最长等待10秒，防止卡死
             MAX_LOG_LINES: 300
         };
 
@@ -192,8 +190,7 @@
                 info: "#94a3b8",
                 ok: "#22c55e",
                 err: "#f87171",
-                warn: "#facc15",
-                slow: "#f97316"
+                warn: "#facc15"
             }[type] || "#94a3b8";
             dom.log.innerHTML += `<div style="color:${color}">[${t}] ${msg}</div>`;
             dom.log.scrollTop = dom.log.scrollHeight;
@@ -224,95 +221,111 @@
         function generateIPs() {
             const ips = [];
             CONFIG.seedList.forEach(seed => {
-                const [a, b, t3Start, t4Start] = seed;
-                const t3End = Math.min(t3Start + CONFIG.SEGMENT_MAX, 255);
-                log(`===== 种子：${a}.${b}.${t3Start}.${t4Start} =====`, "info");
-                for (let t3 = t3Start; t3 <= t3End; t3++) {
-                    const t4Base = t3 === t3Start ? t4Start : 0;
-                    const t4End = Math.min(t4Base + CONFIG.SEGMENT_MAX, 255);
-                    for (let t4 = t4Base; t4 <= t4End; t4++) {
-                        const ip = `${a}.${b}.${t3}.${t4}`;
-                        CONFIG.portList.forEach(port => {
-                            ips.push({ ip, port, id: `${ip}:${port}` });
-                        });
-                    }
+                for (let i = 1; i <= CONFIG.SEGMENT_STEP; i++) {
+                    const ip = `${seed[0]}.${seed[1]}.${seed[2]}.${seed[3] + i}`;
+                    CONFIG.portList.forEach(port => {
+                        ips.push({ ip, port, id: `${ip}:${port}` });
+                    });
                 }
             });
             return ips;
         }
-
-        async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-        async function waitPause() { while (state.paused) await sleep(300); }
 
         async function checkPort(item) {
             return new Promise(resolve => {
                 const start = performance.now();
                 const img = new Image();
                 let resolved = false;
+
                 function cleanup() {
                     if (resolved) return;
                     resolved = true;
                     img.onload = img.onerror = null;
+                    try { delete img; } catch (e) {}
                 }
-                img.onload = () => {
+
+                img.onload = img.onerror = function (e) {
                     cleanup();
-                    resolve({ ...item, time: Math.round(performance.now() - start), alive: true });
+                    const time = Math.round(performance.now() - start);
+                    if (e.type === "error") {
+                        resolve({ ...item, time, alive: true });
+                    } else {
+                        resolve({ ...item, time, alive: false });
+                    }
                 };
-                img.onerror = () => {
-                    cleanup();
-                    resolve({ ...item, time: Math.round(performance.now() - start), alive: false });
-                };
+
                 img.src = `http://${item.ip}:${item.port}/?_t=${Date.now()}${Math.random()}`;
+                
+                // 防卡死保护，最长等待10秒
                 setTimeout(() => {
                     if (!resolved) {
                         cleanup();
-                        resolve({ ...item, time: CONFIG.TIMEOUT, alive: false });
+                        resolve({ ...item, time: CONFIG.MAX_WAIT, alive: false });
                     }
-                }, CONFIG.TIMEOUT);
+                }, CONFIG.MAX_WAIT);
             });
         }
 
-        function sortResults() {
+        function sortAndTrim() {
+            // 按响应时间升序，保留最快的KEEP_TOP个
             state.results.sort((a, b) => a.time - b.time);
+            if (state.results.length > CONFIG.KEEP_TOP) {
+                state.results = state.results.slice(0, CONFIG.KEEP_TOP);
+            }
         }
 
         async function worker() {
             while (state.queue.length > 0 && state.running && !state.paused) {
-                await waitPause();
                 const item = state.queue.shift();
                 if (!item) return;
+                
                 const result = await checkPort(item);
                 state.done++;
+                
                 if (result.alive) {
                     state.hitCount++;
-                    if (result.time <= CONFIG.RESPONSE_LIMIT) {
-                        state.results.push(result);
-                        sortResults();
-                        log(`✅ ${result.ip}:${result.port} - ${result.time}ms ✔️`, "ok");
-                    } else {
-                        log(`⚠️  ${result.ip}:${result.port} - ${result.time}ms (超出300ms)`, "slow");
-                    }
-                } else {
-                    log(`❌ ${result.ip}:${result.port} - 不可达`, "err");
+                    state.results.push(result);
+                    sortAndTrim(); // 每次加入后立即排序裁剪
+                    log(`✅ ${result.ip}:${result.port} - ${result.time}ms (前${state.results.length})`, "ok");
                 }
+                
                 updateUI();
+                await new Promise(r => setTimeout(r, 1));
             }
         }
 
         async function startScan() {
             if (state.running) return;
-            state = { queue: [], results: [], running: true, paused: false, done: 0, hitCount: 0, startTime: Date.now(), total: 0 };
+            
+            state = {
+                queue: [],
+                results: [],
+                running: true,
+                paused: false,
+                done: 0,
+                hitCount: 0,
+                startTime: Date.now(),
+                total: 0
+            };
+            
             dom.log.innerHTML = "";
             dom.out.style.display = "none";
+            
             log("🚀 生成扫描任务...", "info");
             state.queue = generateIPs();
             state.total = state.queue.length;
-            log(`📋 任务总数：${state.total}｜并发：${CONFIG.CONCURRENT}｜保留 ≤${CONFIG.RESPONSE_LIMIT}ms`, "info");
+            
+            log(`📋 共 ${state.total} 个地址待扫描｜并发 ${CONFIG.CONCURRENT}｜保留最快 ${CONFIG.KEEP_TOP}`, "info");
             dom.status.textContent = "扫描中";
             updateUI();
+            
             const workers = [];
-            for (let i = 0; i < CONFIG.CONCURRENT; i++) workers.push(worker());
+            for (let i = 0; i < CONFIG.CONCURRENT; i++) {
+                workers.push(worker());
+            }
+            
             await Promise.all(workers);
+            
             if (state.running) finishScan();
         }
 
@@ -320,12 +333,15 @@
             state.running = false;
             dom.status.textContent = "已完成";
             dom.spinner.style.display = "none";
+            
             log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", "info");
-            log(`🎉 扫描完成！存活：${state.hitCount}｜≤300ms：${state.results.length}`, "ok");
+            log(`🎉 扫描完成！有效：${state.hitCount}｜已保留最快 ${state.results.length} 个`, "ok");
+            
             dom.out.style.display = "block";
             dom.out.textContent = state.results
                 .map((r, i) => `${String(i + 1).padStart(3, ' ')}. ${r.ip}:${r.port} - ${r.time}ms`)
                 .join("\n");
+            
             updateUI();
         }
 
@@ -342,30 +358,29 @@
             dom.status.textContent = "已停止";
             dom.pause.textContent = "暂停";
             log("⏹️ 用户停止扫描", "warn");
+            if (state.done > 0) finishScan();
             updateUI();
         }
 
         function saveResults() {
             if (state.results.length === 0) return;
             const content = [
-                `扫描时间：${new Date().toLocaleString()}`,
-                `筛选条件：响应时间 ≤${CONFIG.RESPONSE_LIMIT}ms`,
-                `共找到：${state.results.length} 个`,
-                "━━━━━━━━━━━━━━━━━━━━",
-                ...state.results.map((r, i) => `${i + 1}. ${r.ip}:${r.port} - ${r.time}ms`),
+                `# 扫描时间：${new Date().toLocaleString()}`,
+                `# 扫描总数：${state.total}｜有效：${state.hitCount}｜保留：${state.results.length}`,
                 "",
-                "仅用于授权网络测试，请勿用于非法用途"
+                ...state.results.map((r, i) => `${r.ip}:${r.port} # ${r.time}ms`)
             ].join("\n");
+            
             const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a");
             a.href = url;
-            a.download = `fast_ip_${new Date().toISOString().slice(0,10)}_${Date.now()}.txt`;
+            a.download = `top200_fast_ip_${new Date().toISOString().slice(0,10)}.txt`;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            log(`💾 已导出 ${state.results.length} 个结果`, "ok");
+            log(`💾 已下载 top200_fast_ip.txt (${state.results.length}条)`, "ok");
         }
 
         dom.start.addEventListener("click", startScan);
