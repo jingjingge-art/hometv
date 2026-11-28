@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>种子扫描｜上限 20｜并发 100｜Top100</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            background: #111827;
+            color: #e5e7eb;
+            font-family: Consolas, Monaco, monospace;
+            padding: 14px;
+            margin: 0;
+        }
+        .wrap { max-width: 1200px; margin: 0 auto; }
+        h1 {
+            font-size: 22px;
+            color: #38bdf8;
+            margin: 0 0 12px 0;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .spinner {
+            width: 22px;
+            height: 22px;
+            border: 3px solid #374151;
+            border-top: 3px solid #22c55e;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            display: none;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .warn {
+            background: #1f2937;
+            border: 1px solid #ef4444;
+            padding: 10px 12px;
+            border-radius: 8px;
+            color: #f87171;
+            margin-bottom: 12px;
+            line-height: 1.5;
+            font-size: 13px;
+        }
+        .btn-area {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        button {
+            padding: 9px 16px;
+            background: #2563eb;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: opacity 0.15s;
+        }
+        button:hover:not(:disabled) { opacity: 0.9; }
+        button.sec { background: #374151; }
+        button.danger { background: #dc2626; }
+        button:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+        .info {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            font-size: 14px;
+            margin-bottom: 8px;
+            background: #1f2937;
+            padding: 8px 12px;
+            border-radius: 6px;
+        }
+        .info b { color: #38bdf8; }
+        #log {
+            height: 380px;
+            overflow-y: auto;
+            background: #020617;
+            border: 1px solid #1e293b;
+            padding: 10px;
+            border-radius: 6px;
+            white-space: nowrap;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        #out {
+            margin-top: 10px;
+            background: #020617;
+            border: 1px solid #1e293b;
+            padding: 10px;
+            border-radius: 6px;
+            color: #22c55e;
+            white-space: pre-wrap;
+            font-size: 13px;
+            max-height: 300px;
+            overflow-y: auto;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <h1>
+            种子扫描
+            <span class="spinner" id="spinner"></span>
+        </h1>
+        <div class="warn">
+            ⚠️ 每段上限 +20｜滑动窗口并发 100｜采集延迟｜保留最快前 100；浏览器探测 ≠ 真实 ICMP ping；仅限自有授权网络测试！
+        </div>
+        <div class="btn-area">
+            <button id="start">开始扫描</button>
+            <button id="pause" class="sec" disabled>暂停</button>
+            <button id="stop" class="danger" disabled>停止</button>
+            <button id="save" class="sec" disabled>下载 top100_fast_ip.txt</button>
+        </div>
+        <div class="info">
+            <span>状态：<b id="status">等待</b></span>
+            <span>进度：<b id="progress">0 / 0</b></span>
+            <span>有效：<b id="hit">0</b></span>
+            <span>最终：<b id="final">0</b></span>
+            <span>耗时：<b id="elapsed">0.0s</b></span>
+        </div>
+        <div id="log"></div>
+        <div id="out"></div>
+    </div>
+
+    <script>
+        const CONFIG = {
+            seedList: [
+                [49, 45, 85, 225],
+                [114, 95, 236, 32],
+                [112, 61, 137, 11],
+                [114, 55, 129, 132],
+                [121, 232, 168, 204],
+                [116, 189, 107, 107],
+                [153, 170, 94, 182],
+                [49, 49, 187, 254],
+                [112, 50, 121, 75],
+                [49, 59, 118, 61],
+                [114, 76, 130, 7],
+                [114, 150, 132, 28]
+            ],
+            portList: [
+                80, 1234, 2233, 2345, 3344, 4455, 5555, 5566, 5678,
+                6666, 6677, 7788, 8080, 8099, 8899, 9901, 9999,
+                12345, 6888, 8188
+            ],
+            SEGMENT_MAX: 20,
+            CONCURRENT: 100,
+            KEEP_TOP: 100,
+            TIMEOUT: 1800,
+            MAX_LOG_LINES: 300
+        };
+
+        const dom = {
+            log: document.getElementById("log"),
+            status: document.getElementById("status"),
+            progress: document.getElementById("progress"),
+            hit: document.getElementById("hit"),
+            final: document.getElementById("final"),
+            elapsed: document.getElementById("elapsed"),
+            out: document.getElementById("out"),
+            spinner: document.getElementById("spinner"),
+            start: document.getElementById("start"),
+            pause: document.getElementById("pause"),
+            stop: document.getElementById("stop"),
+            save: document.getElementById("save")
+        };
+
+        let state = {
+            queue: [],
+            results: [],
+            running: false,
+            paused: false,
+            done: 0,
+            hitCount: 0,
+            startTime: 0,
+            total: 0
+        };
+
+        function log(msg, type = "info") {
+            const t = new Date().toLocaleTimeString();
+            const color = {
+                info: "#94a3b8",
+                ok: "#22c55e",
+                err: "#f87171",
+                warn: "#facc15"
+            }[type] || "#94a3b8";
+            dom.log.innerHTML += `<div style="color:${color}">[${t}] ${msg}</div>`;
+            dom.log.scrollTop = dom.log.scrollHeight;
+            trimLog();
+        }
+
+        function trimLog() {
+            const lines = dom.log.children;
+            if (lines.length > CONFIG.MAX_LOG_LINES) {
+                while (lines.length > CONFIG.MAX_LOG_LINES) {
+                    lines[0].remove();
+                }
+            }
+        }
+
+        function updateUI() {
+            dom.progress.textContent = `${state.done} / ${state.total}`;
+            dom.hit.textContent = state.hitCount;
+            dom.final.textContent = state.results.length;
+            if (state.startTime) {
+                dom.elapsed.textContent = `${((Date.now() - state.startTime) / 1000).toFixed(1)}s`;
+            }
+            dom.spinner.style.display = state.running && !state.paused ? "block" : "none";
+            dom.start.disabled = state.running;
+            dom.pause.disabled = !state.running;
+            dom.stop.disabled = !state.running;
+            dom.save.disabled = state.results.length === 0;
+        }
+
+        // 正确网段生成：t3 起点 +20；起始 t3：t4 原始值 +20；其余 t3：t4 从 0 +20
+        function generateIPs() {
+            const ips = [];
+            CONFIG.seedList.forEach(seed => {
+                const [a, b, t3Start, t4Start] = seed;
+                const t3End = Math.min(t3Start + CONFIG.SEGMENT_MAX, 255);
+                log(`===== 种子：${a}.${b}.${t3Start}.${t4Start} =====`, "info");
+                for (let t3 = t3Start; t3 <= t3End; t3++) {
+                    let t4Base;
+                    if (t3 === t3Start) {
+                        t4Base = t4Start;
+                    } else {
+                        t4Base = 0;
+                    }
+                    const t4End = Math.min(t4Base + CONFIG.SEGMENT_MAX, 255);
+                    for (let t4 = t4Base; t4 <= t4End; t4++) {
+                        const ip = `${a}.${b}.${t3}.${t4}`;
+                        CONFIG.portList.forEach(port => {
+                            ips.push({ ip, port, id: `${ip}:${port}` });
+                        });
+                    }
+                }
+            });
+            return ips;
+        }
+
+        async function sleep(ms) {
+            return new Promise(r => setTimeout(r, ms));
+        }
+
+        async function waitPause() {
+            while (state.paused) await sleep(300);
+        }
+
+        async function checkPort(item) {
+            return new Promise(resolve => {
+                const start = performance.now();
+                const img = new Image();
+                let resolved = false;
+
+                function cleanup() {
+                    if (resolved) return;
+                    resolved = true;
+                    img.onload = null;
+                    img.onerror = null;
+                }
+
+                img.onload = () => {
+                    cleanup();
+                    const time = Math.round(performance.now() - start);
+                    resolve({ ...item, time, alive: true });
+                };
+                img.onerror = () => {
+                    cleanup();
+                    const time = Math.round(performance.now() - start);
+                    resolve({ ...item, time, alive: false });
+                };
+
+                img.src = `http://${item.ip}:${item.port}/?_t=${Date.now()}${Math.random()}`;
+
+                setTimeout(() => {
+                    if (!resolved) {
+                        cleanup();
+                        resolve({ ...item, time: CONFIG.TIMEOUT, alive: false });
+                    }
+                }, CONFIG.TIMEOUT);
+            });
+        }
+
+        // 实时排序，保留前 100
+        function sortAndTrim() {
+            state.results.sort((a, b) => a.time - b.time);
+            if (state.results.length > CONFIG.KEEP_TOP) {
+                state.results = state.results.slice(0, CONFIG.KEEP_TOP);
+            }
+        }
+
+        async function worker() {
+            while (state.queue.length > 0 && state.running && !state.paused) {
+                await waitPause();
+                await sleep(0);
+                const item = state.queue.shift();
+                if (!item) return;
+
+                const result = await checkPort(item);
+                state.done++;
+
+                if (result.alive) {
+                    state.hitCount++;
+                    state.results.push(result);
+                    sortAndTrim();
+                    log(`✅ ${result.ip}:${result.port} - ${result.time}ms (Top:${state.results.length})`, "ok");
+                } else {
+                    log(`❌ ${result.ip}:${result.port} - ${result.time}ms`, "err");
+                }
+                updateUI();
+            }
+        }
+
+        async function startScan() {
+            if (state.running) return;
+
+            state = {
+                queue: [],
+                results: [],
+                running: true,
+                paused: false,
+                done: 0,
+                hitCount: 0,
+                startTime: Date.now(),
+                total: 0
+            };
+
+            dom.log.innerHTML = "";
+            dom.out.style.display = "none";
+            log("🚀 生成扫描任务...", "info");
+
+            state.queue = generateIPs();
+            state.total = state.queue.length;
+            log(`📋 全部任务：${state.total}`, "info");
+            dom.status.textContent = "扫描中";
+            updateUI();
+
+            const workers = [];
+            for (let i = 0; i < CONFIG.CONCURRENT; i++) {
+                workers.push(worker());
+            }
+            await Promise.all(workers);
+
+            if (state.running) {
+                finishScan();
+            }
+        }
+
+        function finishScan() {
+            state.running = false;
+            dom.status.textContent = "已完成";
+            dom.spinner.style.display = "none";
+
+            log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", "info");
+            log(`🎉 扫描完成！有效：${state.hitCount}｜保留前 ${state.results.length}`, "ok");
+
+            dom.out.style.display = "block";
+            dom.out.textContent = state.results
+                .map((r, i) => `${String(i + 1).padStart(3, ' ')}. ${r.ip}:${r.port} - ${r.time}ms`)
+                .join("\n");
+            updateUI();
+        }
+
+        function pauseScan() {
+            state.paused = !state.paused;
+            dom.pause.textContent = state.paused ? "继续" : "暂停";
+            dom.status.textContent = state.paused ? "已暂停" : "扫描中";
+            log(state.paused ? "⏸️ 已暂停" : "▶️ 继续扫描", "warn");
+        }
+
+        function stopScan() {
+            state.running = false;
+            state.paused = false;
+            dom.status.textContent = "已停止";
+            dom.pause.textContent = "暂停";
+            log("⏹️ 用户停止扫描", "warn");
+            updateUI();
+        }
+
+        function saveResults() {
+            if (state.results.length === 0) return;
+            const content = state.results
+                .map((r, i) => `${i + 1}. ${r.ip}:${r.port} - ${r.time}ms`)
+                .join("\n");
+            const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `top100_fast_ip_${new Date().toISOString().slice(0, 10)}.txt`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            log("💾 文件已下载", "ok");
+        }
+
+        dom.start.addEventListener("click", startScan);
+        dom.pause.addEventListener("click", pauseScan);
+        dom.stop.addEventListener("click", stopScan);
+        dom.save.addEventListener("click", saveResults);
+    </script>
+</body>
+</html>
